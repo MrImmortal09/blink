@@ -191,6 +191,9 @@ jobs:
           GROUP_ID = $GROUP_SUFFIX
           CLOUD_ID = $BUNDLE_ID
           KEYCHAIN_ID1 = $BUNDLE_ID
+          BLINK_PROVISIONING_PROFILE = $PROFILE_UUID
+          CODE_SIGN_IDENTITY = iPhone Distribution
+          CODE_SIGN_IDENTITY[sdk=iphoneos*] = iPhone Distribution
           SWIFT_ACTIVE_COMPILATION_CONDITIONS[config=Debug] = BLINK_PUBLISHING_OPTION_DEVELOPER
           SWIFT_ACTIVE_COMPILATION_CONDITIONS[config=Release] = BLINK_PUBLISHING_OPTION_TESTFLIGHT
           BLINK_MIGRATION_SCHEME = blinkv15
@@ -204,33 +207,16 @@ jobs:
           echo "Configuring Blink.entitlements to match provisioning profile..."
           python3 -c "
           import plistlib
-          with open('Blink/Blink.entitlements', 'rb') as f:
-              ent = plistlib.load(f)
-
-          ent['aps-environment'] = '$APS_ENV'
-          ent['com.apple.security.application-groups'] = ['$APP_GROUP']
-          ent['keychain-access-groups'] = ['$TEAM_ID.*']
-
-          # Remove entitlements not present in ad-hoc profile to prevent signing errors
-          for k in [
-              'com.apple.developer.web-browser',
-              'com.apple.developer.icloud-container-identifiers',
-              'com.apple.developer.icloud-services',
-              'com.apple.developer.ubiquity-container-identifiers',
-              'com.apple.developer.ubiquity-kvstore-identifier',
-              'com.apple.security.app-sandbox',
-              'com.apple.security.device.bluetooth',
-              'com.apple.security.device.camera',
-              'com.apple.security.files.user-selected.read-write',
-              'com.apple.security.network.client',
-              'com.apple.security.network.server',
-              'com.apple.security.personal-information.location'
-          ]:
-              ent.pop(k, None)
-
+          ent = {
+              'aps-environment': '$APS_ENV',
+              'com.apple.security.application-groups': ['$APP_GROUP'],
+              'keychain-access-groups': ['$TEAM_ID.*'],
+              'com.apple.developer.associated-domains': ['webcredentials:blink.sh'],
+              'com.apple.developer.user-fonts': ['app-usage'],
+          }
           with open('Blink/Blink.entitlements', 'wb') as f:
               plistlib.dump(ent, f)
-          print('Adjusted Blink.entitlements successfully.')
+          print('Wrote clean Blink.entitlements successfully.')
           "
 
       - name: Resolve Xcode Package Dependencies
@@ -251,11 +237,6 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/Blink.xcarchive \
-            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_STYLE="Manual" \
-            CODE_SIGN_IDENTITY="iPhone Distribution" \
-            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
             COMPILER_INDEX_STORE_ENABLE=NO \
             archive
 
