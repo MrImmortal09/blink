@@ -20,7 +20,7 @@ on:
 jobs:
   build-ios:
     name: Build, Sign & Release iOS
-    runs-on: macos-15
+    runs-on: macos-latest
     permissions:
       contents: write
 
@@ -31,19 +31,19 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Select Xcode Version
+      - name: Select and Setup Xcode Environment
         run: |
           echo "Available Xcode installations:"
           ls -d /Applications/Xcode*.app || true
-          if [ -d "/Applications/Xcode_16.1.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_16.1.app
-          elif [ -d "/Applications/Xcode_16.0.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_16.0.app
-          elif [ -d "/Applications/Xcode_15.4.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_15.4.app
-          elif [ -d "/Applications/Xcode_16.2.app" ]; then
-            sudo xcode-select -s /Applications/Xcode_16.2.app
-          fi
+          # Ensure CoreSimulator is fresh and register all installed runtimes
+          sudo killall -9 com.apple.CoreSimulator.CoreSimulatorService || true
+          for rt in /Library/Developer/CoreSimulator/Profiles/Runtimes/*.simruntime; do
+            if [ -d "$rt" ]; then
+              echo "Registering simulator runtime: $rt"
+              xcrun simctl runtime add "$rt" || true
+            fi
+          done
+          xcrun simctl list devices > /dev/null || true
           xcodebuild -version
           xcodebuild -showsdks
 
@@ -237,6 +237,10 @@ jobs:
         run: |
           xcodebuild -resolvePackageDependencies -project Blink.xcodeproj -scheme Blink
 
+      - name: Check Available Destinations
+        run: |
+          xcodebuild -showdestinations -project Blink.xcodeproj -scheme Blink
+
       - name: Build and Archive iOS App
         run: |
           set -e
@@ -244,7 +248,6 @@ jobs:
 
           xcodebuild -project Blink.xcodeproj \
             -scheme Blink \
-            -sdk iphoneos \
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/Blink.xcarchive \
