@@ -1,0 +1,435 @@
+name: Build & Release Signed iOS App (IPA)
+
+on:
+  push:
+    branches:
+      - release
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: 'Version bump type (none, patch, minor, major)'
+        required: true
+        default: 'none'
+        type: choice
+        options:
+          - none
+          - patch
+          - minor
+          - major
+
+jobs:
+  build-ios:
+    name: Build, Sign & Release iOS
+    runs-on: macos-15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Select Xcode Version
+        run: |
+          echo "Available Xcode installations:"
+          ls -d /Applications/Xcode*.app || true
+          if [ -d "/Applications/Xcode_16.1.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.1.app
+          elif [ -d "/Applications/Xcode_16.0.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.0.app
+          elif [ -d "/Applications/Xcode_15.4.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_15.4.app
+          elif [ -d "/Applications/Xcode_16.2.app" ]; then
+            sudo xcode-select -s /Applications/Xcode_16.2.app
+          fi
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      - name: Configure Git
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bump_type != '' && github.event.inputs.bump_type != 'none' }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine Current Version
+        id: get_version
+        run: |
+          VERSION=$(python3 -c "
+          import re
+          with open('Blink.xcodeproj/project.pbxproj') as f:
+              content = f.read()
+          m = re.findall(r'MARKETING_VERSION = ([0-9.]+);', content)
+          print(m[-1] if m else '18.6.3')
+          ")
+          echo "NEW_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Building version: $VERSION"
+
+      - name: Bump Version
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.bump_type != '' && github.event.inputs.bump_type != 'none' }}
+        id: version_bump
+        run: |
+          set -e
+          BUMP_TYPE="${{ github.event.inputs.bump_type }}"
+          python3 -c "
+          import re, sys
+          bump = '$BUMP_TYPE'
+          with open('Blink.xcodeproj/project.pbxproj', 'r') as f:
+              content = f.read()
+          m = re.findall(r'MARKETING_VERSION = ([0-9.]+);', content)
+          current = m[-1] if m else '18.6.3'
+          parts = [int(p) for p in current.split('.')]
+          while len(parts) < 3:
+              parts.append(0)
+          if bump == 'patch':
+              parts[2] += 1
+          elif bump == 'minor':
+              parts[1] += 1
+              parts[2] = 0
+          elif bump == 'major':
+              parts[0] += 1
+              parts[1] = 0
+              parts[2] = 0
+          new_ver = '.'.join(str(p) for p in parts)
+          new_content = re.sub(r'MARKETING_VERSION = [0-9.]+;', f'MARKETING_VERSION = {new_ver};', content)
+          with open('Blink.xcodeproj/project.pbxproj', 'w') as f:
+              f.write(new_content)
+          print(f'NEW_VERSION={new_ver}')
+          with open(sys.argv[1], 'a') as f:
+              f.write(f'NEW_VERSION={new_ver}\n')
+          " "$GITHUB_ENV"
+          git add Blink.xcodeproj/project.pbxproj
+          git commit -m "chore(release): bump iOS version to v$NEW_VERSION"
+          git tag "v$NEW_VERSION"
+          git push origin HEAD:${{ github.ref_name }}
+          git push origin --tags
+
+      - name: Fetch Frameworks and Resources
+        run: |
+          ./get_frameworks.sh
+          ./get_resources.sh
+          rm -rf Blink.xcodeproj/project.xcworkspace/xcshareddata/Blink.xcscmblueprint 2>/dev/null || true
+
+      - name: Install Apple Certificate and Provisioning Profile
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISION_BASE64: ${{ secrets.IOS_PROVISION_BASE64 }}
+        run: |
+          set -e
+
+          # Ensure temp paths
+          CERT_PATH="$RUNNER_TEMP/build_cert.p12"
+          PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 20)
+
+          # Decode certificate and provisioning profile
+          echo -n "$IOS_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+          echo -n "$IOS_PROVISION_BASE64" | base64 --decode -o "$PP_PATH"
+
+          # Create temporary keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Download and import Apple Worldwide Developer Relations G3 Intermediate CA
+          curl -sSL https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer -o "$RUNNER_TEMP/AppleWWDRCAG3.cer"
+          security import "$RUNNER_TEMP/AppleWWDRCAG3.cer" -k "$KEYCHAIN_PATH" -T /usr/bin/codesign
+
+          # Import .p12 certificate into keychain
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$IOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Append keychain to search list
+          EXISTING_KEYCHAINS=$(security list-keychains -d user | tr -d '"')
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $EXISTING_KEYCHAINS
+
+          # Extract metadata from provisioning profile using Python
+          python3 -c "
+          import plistlib, subprocess, sys
+          p = subprocess.run(['security', 'cms', '-D', '-i', '$PP_PATH'], capture_output=True)
+          plist = plistlib.loads(p.stdout)
+          uuid = plist.get('UUID', '')
+          team_id = plist.get('TeamIdentifier', [''])[0]
+          app_id = plist.get('Entitlements', {}).get('application-identifier', '')
+          bundle_id = app_id[len(team_id)+1:] if team_id and app_id.startswith(team_id + '.') else app_id
+          groups = plist.get('Entitlements', {}).get('com.apple.security.application-groups', [])
+          app_group = groups[0] if groups else 'group.b96296c92bb96aa2.1'
+          aps_env = plist.get('Entitlements', {}).get('aps-environment', 'production')
+
+          with open(sys.argv[1], 'a') as f:
+              f.write(f'PROFILE_UUID={uuid}\n')
+              f.write(f'TEAM_ID={team_id}\n')
+              f.write(f'BUNDLE_ID={bundle_id}\n')
+              f.write(f'APP_GROUP={app_group}\n')
+              f.write(f'APS_ENV={aps_env}\n')
+
+          print(f'Extracted Profile UUID: {uuid}')
+          print(f'Extracted Team ID: {team_id}')
+          print(f'Extracted Bundle ID: {bundle_id}')
+          print(f'Extracted App Group: {app_group}')
+          print(f'Extracted APS Environment: {aps_env}')
+          " "$GITHUB_ENV"
+
+          # Install provisioning profile
+          PROFILE_UUID=$(python3 -c "import plistlib, subprocess; p = subprocess.run(['security', 'cms', '-D', '-i', '$PP_PATH'], capture_output=True); print(plistlib.loads(p.stdout).get('UUID', ''))")
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/${PROFILE_UUID}.mobileprovision
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+
+      - name: Configure developer_setup.xcconfig and Entitlements
+        run: |
+          set -e
+          echo "Writing developer_setup.xcconfig..."
+          GROUP_SUFFIX="${APP_GROUP#group.}"
+          cat <<EOF > developer_setup.xcconfig
+          TEAM_ID = $TEAM_ID
+          BUNDLE_ID = $BUNDLE_ID
+          GROUP_ID = $GROUP_SUFFIX
+          CLOUD_ID = $BUNDLE_ID
+          KEYCHAIN_ID1 = $BUNDLE_ID
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS[config=Debug] = BLINK_PUBLISHING_OPTION_DEVELOPER
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS[config=Release] = BLINK_PUBLISHING_OPTION_TESTFLIGHT
+          BLINK_MIGRATION_SCHEME = blinkv15
+          WHATS_NEW_URL = http:/\$()/localhost/whats-new
+          CONVERSION_OPPORTUNITY_URL = http:/\$()/localhost/conversionOpportunity
+          WHATS_NEW_GITHUB_URL = http:/\$()/localhost/conversionOpportunity
+          BLINK_APP_FONT = JetBrains Mono
+          EOF
+          cat developer_setup.xcconfig
+
+          echo "Configuring Blink.entitlements to match provisioning profile..."
+          python3 -c "
+          import plistlib
+          with open('Blink/Blink.entitlements', 'rb') as f:
+              ent = plistlib.load(f)
+
+          ent['aps-environment'] = '$APS_ENV'
+          ent['com.apple.security.application-groups'] = ['$APP_GROUP']
+          ent['keychain-access-groups'] = ['$TEAM_ID.*']
+
+          # Remove entitlements not present in ad-hoc profile to prevent signing errors
+          for k in [
+              'com.apple.developer.web-browser',
+              'com.apple.developer.icloud-container-identifiers',
+              'com.apple.developer.icloud-services',
+              'com.apple.developer.ubiquity-container-identifiers',
+              'com.apple.developer.ubiquity-kvstore-identifier',
+              'com.apple.security.app-sandbox',
+              'com.apple.security.device.bluetooth',
+              'com.apple.security.device.camera',
+              'com.apple.security.files.user-selected.read-write',
+              'com.apple.security.network.client',
+              'com.apple.security.network.server',
+              'com.apple.security.personal-information.location'
+          ]:
+              ent.pop(k, None)
+
+          with open('Blink/Blink.entitlements', 'wb') as f:
+              plistlib.dump(ent, f)
+          print('Adjusted Blink.entitlements successfully.')
+          "
+
+      - name: Resolve Xcode Package Dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies -project Blink.xcodeproj -scheme Blink
+
+      - name: Build and Archive iOS App
+        run: |
+          set -e
+          mkdir -p build
+
+          xcodebuild -project Blink.xcodeproj \
+            -scheme Blink \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/Blink.xcarchive \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE="Manual" \
+            CODE_SIGN_IDENTITY="iPhone Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            archive
+
+      - name: Export Archive to Signed IPA
+        run: |
+          set -e
+          mkdir -p build/export
+
+          cat <<EOF > ExportOptions.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>ad-hoc</string>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>teamID</key>
+              <string>$TEAM_ID</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>$BUNDLE_ID</key>
+                  <string>$PROFILE_UUID</string>
+              </dict>
+              <key>signingCertificate</key>
+              <string>iPhone Distribution</string>
+              <key>compileBitcode</key>
+              <false/>
+              <key>thinning</key>
+              <string>&lt;none&gt;</string>
+          </dict>
+          </plist>
+          EOF
+
+          if xcodebuild -exportArchive \
+            -archivePath build/Blink.xcarchive \
+            -exportPath build/export \
+            -exportOptionsPlist ExportOptions.plist; then
+              echo "xcodebuild exportArchive succeeded!"
+              if [ ! -f "build/export/Blink.ipa" ]; then
+                cp build/export/*.ipa build/export/Blink.ipa 2>/dev/null || true
+              fi
+          else
+              echo "xcodebuild -exportArchive fallback: packaging signed app bundle directly..."
+              mkdir -p build/export/Payload
+              cp -R build/Blink.xcarchive/Products/Applications/Blink.app build/export/Payload/
+              cd build/export
+              zip -qr Blink.ipa Payload
+              cd ../..
+          fi
+
+          test -f build/export/Blink.ipa || (echo "Error: Blink.ipa was not created!" && exit 1)
+          echo "IPA successfully created at $(pwd)/build/export/Blink.ipa"
+
+      - name: Verify IPA Code Signature
+        run: |
+          unzip -q build/export/Blink.ipa -d /tmp/ipa_verify
+          codesign -dvvv --entitlements :- /tmp/ipa_verify/Payload/Blink.app
+          rm -rf /tmp/ipa_verify
+
+      - name: Generate Release Manifest & Release Notes
+        run: |
+          set -e
+          TAG="v${{ env.NEW_VERSION }}"
+          IPA_URL="https://github.com/MrImmortal09/blink/releases/download/${TAG}/Blink.ipa"
+          RAW_MANIFEST_URL="https://raw.githubusercontent.com/MrImmortal09/blink/${TAG}/manifest.plist"
+          OTA_LINK="itms-services://?action=download-manifest&url=https%3A%2F%2Fraw.githubusercontent.com%2FMrImmortal09%2Fblink%2Frelease%2Fmanifest.plist"
+
+          # Generate release manifest.plist
+          cat <<EOF > manifest.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>items</key>
+              <array>
+                  <dict>
+                      <key>assets</key>
+                      <array>
+                          <dict>
+                              <key>kind</key>
+                              <string>software-package</string>
+                              <key>url</key>
+                              <string>$IPA_URL</string>
+                          </dict>
+                      </array>
+                      <key>metadata</key>
+                      <dict>
+                          <key>bundle-identifier</key>
+                          <string>$BUNDLE_ID</string>
+                          <key>bundle-version</key>
+                          <string>${{ env.NEW_VERSION }}</string>
+                          <key>kind</key>
+                          <string>software</string>
+                          <key>title</key>
+                          <string>Blink</string>
+                      </dict>
+                  </dict>
+              </array>
+          </dict>
+          </plist>
+          EOF
+
+          # Generate release notes
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 --match="v*" HEAD^ 2>/dev/null || git rev-list --max-parents=0 HEAD)
+          COMMITS=$(git log ${PREVIOUS_TAG}..HEAD --pretty=format:"- %s (%h)" 2>/dev/null || echo "- Automated iOS signed build")
+
+          cat <<EOF > release_notes.md
+          ## 📲 Blink iOS Release v${{ env.NEW_VERSION }} (Signed)
+
+          ### Option 1: Open Web Installer in Safari (Recommended)
+          👉 **[Tap Here to Open Installer Webpage](https://htmlpreview.github.io/?https://github.com/MrImmortal09/blink/blob/release/install.html)**  
+          *(Open the link above in Safari, then tap **Install App**)*
+
+          ---
+
+          ### Option 2: Direct itms-services Link (Copy & Paste)
+          Copy the link below and paste it directly into **Safari's address bar** on your registered iPhone:
+
+          \`\`\`text
+          $OTA_LINK
+          \`\`\`
+
+          *(Copy the code block above &rarr; Open Safari &rarr; Paste into URL bar &rarr; Tap **Go** &rarr; Tap **Install**)*
+
+          ---
+
+          ### Option 3: Version-Specific Install Link (v${{ env.NEW_VERSION }})
+          \`\`\`text
+          itms-services://?action=download-manifest&url=https%3A%2F%2Fraw.githubusercontent.com%2FMrImmortal09%2Fblink%2F${TAG}%2Fmanifest.plist
+          \`\`\`
+
+          ---
+
+          ### 📦 Manual Download & Sideloading
+          - Download the signed **[Blink.ipa]($IPA_URL)** directly.
+          - Sideload via [Signulous Dashboard](https://www.signulous.com/dashboard) (Upload App), AltStore, Scarlet, or TrollStore.
+
+          ---
+
+          ### ⚠️ iPhone Setup Requirement (iOS 16, 17, 18)
+          To launch installed ad-hoc signed apps on your device:
+          1. Go to **Settings > Privacy & Security**.
+          2. Scroll down to **Developer Mode** and turn it **ON**.
+          3. Restart your iPhone when prompted, then unlock and tap **Turn On**.
+
+          ---
+
+          ### 📝 Changes in this release:
+          $COMMITS
+          EOF
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Blink-iOS-v${{ env.NEW_VERSION }}
+          path: |
+            build/export/Blink.ipa
+            manifest.plist
+            install.html
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.NEW_VERSION }}
+          name: Release v${{ env.NEW_VERSION }} (iOS Signed)
+          body_path: release_notes.md
+          files: |
+            build/export/Blink.ipa
+            manifest.plist
+            install.html
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clean up Keychain
+        if: always()
+        run: |
+          if [ -n "$KEYCHAIN_PATH" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
